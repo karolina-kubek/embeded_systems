@@ -8,12 +8,16 @@
 #include "dev/sht11-sensor.h"
 #include <math.h>
 #include <stdio.h>
+#include "cc2420.h"
 
 static int val;
 static float s = 0;
 static float temp_avg = 0; 
 static float humid_avg = 0;
+static int maxneighbor = 0;
 
+static uint16_t max_rssi = 0;
+static int i = 0;
 /* This is the structure of broadcast messages. */
 struct broadcast_message {
   uint8_t seqno;
@@ -22,10 +26,10 @@ struct broadcast_message {
 /* This is the structure of unicast ping messages. */
 struct unicast_message {
 
- int temp_dec;
- float temp_frac;
- int humid_dec;
- float humid_frac;
+ uint8_t temp_dec;
+ uint8_t temp_frac;
+ uint8_t humid_dec;
+ uint8_t humid_frac;
  
 };
 
@@ -42,7 +46,7 @@ struct neighbor {
 };
 
 /* This #define defines the maximum amount of neighbors we can remember. */
-#define MAX_NEIGHBORS 16
+#define MAX_NEIGHBORS 20
 
 /* This MEMB() definition defines a memory pool from which we allocate
    neighbor entries. */
@@ -132,13 +136,11 @@ broadcast_recv(struct broadcast_conn *c, const rimeaddr_t *from)
   n->last_seqno = m->seqno;
 
   /* Print out a message. */
-  printf("broadcast message received from %d.%d with seqno %d, RSSI %u, LQI %u, avg seqno gap %d.%02d\n",
+  printf("Broadcast message received from %d.%d with seqno %d, RSSI %u, LQI %u\n\n",
          from->u8[0], from->u8[1],
          m->seqno,
-         packetbuf_attr(PACKETBUF_ATTR_RSSI),
-         packetbuf_attr(PACKETBUF_ATTR_LINK_QUALITY),
-         (int)(n->avg_seqno_gap / SEQNO_EWMA_UNITY),
-         (int)(((100UL * n->avg_seqno_gap) / SEQNO_EWMA_UNITY) % 100));
+         n->last_rssi,
+         n->last_lqi);
 }
 /* This is where we define what function to be called when a broadcast
    is received. We pass a pointer to this structure in the
@@ -149,13 +151,17 @@ static const struct broadcast_callbacks broadcast_call = {broadcast_recv};
 static void
 recv_uc(struct unicast_conn *c, const rimeaddr_t *from)
 {
-  /*struct unicast_message *msg;
+  struct unicast_message *msg;
+  /*When a mote receives a packet, the node turns on the green LED.*/
+	leds_on(LEDS_GREEN);
+	
+  // Grab the pointer to the incoming data. 
+  msg = packetbuf_dataptr();
 
-   Grab the pointer to the incoming data. 
-  msg = packetbuf_dataptr();*/
-
-  printf("unicast message received from %d.%d\n", from->u8[0], from->u8[1]);
-  
+  printf("Unicast message received from %d.%d\n", from->u8[0], from->u8[1]);
+	printf("Received Temperature=%u.%02u C \n", msg->temp_dec, msg->temp_frac);
+  printf("Received Humidity=%u.%02u %% \n\n", msg->humid_dec, msg->temp_frac);
+  //leds_off(3);
 }
 static const struct unicast_callbacks unicast_callbacks = {recv_uc};
 /*---------------------------------------------------------------------------*/
@@ -171,7 +177,7 @@ PROCESS_THREAD(broadcast_process, ev, data)
 
   /*Each mote sends periodically a broadcast. However, it does not send any broadcast 			
 	  message until the user click the button.*/
-	printf("Click the button to start\n");
+	printf("Click the button to start the broadcast\n");
 	SENSORS_ACTIVATE(button_sensor);
 	PROCESS_WAIT_EVENT_UNTIL((ev==sensors_event) && (data == &button_sensor));
 	printf("Broadcast starting...\n");
@@ -201,76 +207,70 @@ PROCESS_THREAD(unicast_process, ev, data)
   PROCESS_BEGIN();
 
   unicast_open(&unicast, 146, &unicast_callbacks);
-
+	
   while(1) {
     static struct etimer et;
-    struct unicast_message msg;
-    struct neighbor *n;
-    int maxneighbor;
-    int i = 0;
-    uint16_t max_rssi = 0;
-    short k = 0;
+    static struct unicast_message msg;
+    static struct neighbor *n;
     
-		/******************************************************************************/
-	  // Each mote periodically samples temperature and humidity and computes its average 
-    // over 5 samples.
-		while( k < 5 )
-		{
-			etimer_set(&et, CLOCK_SECOND * 5);
+			
+		/*Each mote samples temperature and humidity and computes its average over 5 samples.*/
+		for(i = 0; i < 5; i = i + 1) {
+		
+			etimer_set(&et, CLOCK_SECOND * 4);
+					
 			PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
-			
+		
 			SENSORS_ACTIVATE(sht11_sensor);
-			val = sht11_sensor.value(SHT11_SENSOR_TEMP);
 			
+			val = sht11_sensor.value(SHT11_SENSOR_TEMP);
+		
 			if(val != -1)
 			{
 				s= ((0.01*val) - 39.60);
 				temp_avg = temp_avg + s;
-
 			}
 			val=sht11_sensor.value(SHT11_SENSOR_HUMIDITY);
-			
+		
 			if(val != -1)
 			{
 				s= (((0.0405*val) - 4) + ((-2.8 * 0.000001)*(pow(val,2))));
 				humid_avg = humid_avg + s;
 			}
-			
+		
 			etimer_reset(&et);
 			SENSORS_DEACTIVATE(sht11_sensor);
-	
-			k = k + 1;
 		}
-		
+	
 		temp_avg = temp_avg / 5;
 		msg.temp_dec = temp_avg;
-    msg.temp_frac = temp_avg - msg.temp_dec;
-		printf("\nTemperature=%d.%02u C \n", msg.temp_dec, (unsigned int)(msg.temp_frac * 100));
+	  msg.temp_frac = (unsigned int)temp_avg - msg.temp_dec;
+		//printf("\nTemperature=%d.%02u C \n", msg.temp_dec, (unsigned int)(msg.temp_frac * 100));
 		humid_avg = humid_avg / 5;
 		msg.humid_dec = humid_avg;
-    msg.humid_frac = humid_avg - msg.humid_dec;
-		printf("Humidity=%d.%02u %% \n", msg.humid_dec, (unsigned int)(msg.humid_frac * 100));
-    /********************************************************************/
+	  msg.humid_frac = (unsigned int)humid_avg - msg.humid_dec;
+		//printf("Humidity=%d.%02u %% \n", msg.humid_dec, (unsigned int)(msg.humid_frac * 100));
 
-		/*Each mote sends its sample to its neighbour with the highest RSSI value*/
+			
 		if(list_length(neighbors_list) > 0) {
+			/*Each mote sends its sample to its neighbour with the highest RSSI value*/
 		
+			i = 0;
 			for(n = list_head(neighbors_list); n != NULL; n = list_item_next(n)) {
-				printf("max rssi: %u", max_rssi);
-				printf("max neighbour num: '%d", maxneighbor);
+				
 				if (n->last_rssi > max_rssi) {
 					max_rssi = n->last_rssi;
 					maxneighbor = i;
 				}
 				i = i + 1;
 			}
-			
+			printf("Max RSSI value: %u \n", max_rssi);
 			n = list_head(neighbors_list);
       for(i = 0; i < maxneighbor; i++) {
         n = list_item_next(n);
       }
       
-      printf("sending unicast to %d.%d\n", n->addr.u8[0], n->addr.u8[1]);
+      printf("Sending unicast with samples to %d.%d\n\n", n->addr.u8[0], n->addr.u8[1]);
       packetbuf_copyfrom(&msg, sizeof(msg));
       unicast_send(&unicast, &n->addr);
     }
